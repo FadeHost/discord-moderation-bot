@@ -1,5 +1,7 @@
 # FadeHost Moderation Bot
 
+[![Deploy to FadeHost](https://fadehost.com/deploy-button.svg)](https://laplace.fadehost.com/register?intent=bot&repo=https://github.com/FadeHost/discord-moderation-bot)
+
 Warnings that are remembered, timeouts, kicks, bans, message purges and slowmode, every action logged to a channel of your choice.
 
 ## Setup on FadeHost
