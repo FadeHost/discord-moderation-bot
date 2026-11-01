@@ -2,6 +2,7 @@ import {
   ActionRowBuilder, AutoModerationRuleTriggerType, ButtonBuilder, ButtonStyle, ChannelType, EmbedBuilder, GatewayIntentBits, MessageFlags, OverwriteType,
   PermissionFlagsBits,
 } from 'discord.js';
+import { createHash } from 'node:crypto';
 import { automodSteps, inviteCodes } from './automod.js';
 import { fit, postLog, runSteps } from './modlog.js';
 import { STAFF } from './protection.js';
@@ -9,6 +10,25 @@ import { save } from './store.js';
 
 const P = PermissionFlagsBits;
 const REASON = 'Moderation bot: /securitycheck fix';
+
+// Servers with a change running. A second click, a second admin, or a fix
+// racing /automod-setup would otherwise apply it twice (two #mod-log channels).
+const busy = new Set();
+
+/** Runs a change unless another one is running for the server; false when it had to wait its turn. */
+async function oneAtATime(guildId, change) {
+  if (busy.has(guildId)) return false;
+  busy.add(guildId);
+  try {
+    await change();
+  } finally {
+    busy.delete(guildId);
+  }
+  return true;
+}
+
+/** A short fingerprint of a plan, carried by the confirm button so the second click changes only what the first one showed. */
+const planId = (steps) => createHash('sha1').update(steps.map((s) => s.text).join('\n')).digest('hex').slice(0, 12);
 
 // What the bot needs to clean up spam, act on members, keep its log, set up AutoMod and apply the fixes below.
 const NEEDS = [
@@ -197,7 +217,7 @@ function render(risks) {
 
 /** The fix buttons: the first click shows exactly what will change, the second one changes it. */
 export async function securityButton(interaction, settings) {
-  const [, step, id] = interaction.customId.split(':');
+  const [, step, id, shown] = interaction.customId.split(':');
   if (!interaction.memberPermissions?.has(P.ManageGuild)) {
     await interaction.reply({ content: 'Only members with Manage Server can change these settings.', flags: MessageFlags.Ephemeral });
     return;
@@ -208,43 +228,52 @@ export async function securityButton(interaction, settings) {
   }
   if (step === 'ask') await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   else await interaction.deferUpdate();
-  const risk = (await findRisks(interaction.guild, settings)).find((found) => found.id === id && found.fix);
-  if (!risk) {
-    await interaction.editReply({ content: 'That is already fixed.', embeds: [], components: [] });
-    return;
-  }
-  const steps = await risk.steps();
-  if (step === 'ask') {
-    await interaction.editReply({
-      content: fit([`**${risk.fix}?** This will:`, ...steps.map((s) => `- ${s.text}`)]),
-      components: [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`sec:do:${id}`).setLabel('Yes, change it').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId('sec:no').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
-      )],
-    });
-    return;
-  }
-  const lines = await runSteps(steps);
-  await interaction.editReply({ content: fit(lines), components: [] });
-  await logChange(interaction, settings, risk.fix, lines);
+  // Planned again inside the lock, so a change that just finished is seen.
+  const ran = await oneAtATime(interaction.guildId, async () => {
+    const risk = (await findRisks(interaction.guild, settings)).find((found) => found.id === id && found.fix);
+    if (!risk) {
+      await interaction.editReply({ content: 'That is already fixed.', embeds: [], components: [] });
+      return;
+    }
+    const steps = await risk.steps();
+    // The settings moved between the two clicks: show the new plan and ask again.
+    if (step === 'ask' || planId(steps) !== shown) {
+      const changed = step === 'ask' ? '' : 'The settings changed since you looked. ';
+      await interaction.editReply({
+        content: fit([`${changed}**${risk.fix}?** This will:`, ...steps.map((s) => `- ${s.text}`)]),
+        components: [new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(`sec:do:${id}:${planId(steps)}`).setLabel('Yes, change it').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('sec:no').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+        )],
+      });
+      return;
+    }
+    const lines = await runSteps(steps);
+    await interaction.editReply({ content: fit(lines), components: [] });
+    await logChange(interaction, settings, risk.fix, lines);
+  });
+  if (!ran) await interaction.editReply({ content: 'Another change is running on this server. Try again in a moment.', components: [] });
 }
 
 /** /automod-setup */
 export async function automodSetup(interaction, settings) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  let plan;
-  try {
-    plan = await automodSteps(interaction.guild, settings, inviteCodes(interaction.options.getString('allow')));
-  } catch (err) {
-    await interaction.editReply(err.code === 50013 ? 'The bot needs the Manage Server permission to set up AutoMod.' : `Could not read the AutoMod rules: ${err.message}`);
-    return;
-  }
-  const lines = await runSteps(plan.steps);
-  if (plan.kept) lines.push(`Kept your own mention spam rule "${plan.kept}": a server can have only one.`);
-  if (!plan.alerts) lines.push('Blocked messages are not reported anywhere yet: pick a log channel with /modlog, then run /automod-setup again.');
-  if (!plan.exempt) lines.push('The bot has no role of its own to exempt, so AutoMod may block its own log posts when they quote a link.');
-  await interaction.editReply(fit(lines));
-  await logChange(interaction, settings, 'AutoMod setup', lines);
+  const ran = await oneAtATime(interaction.guildId, async () => {
+    let plan;
+    try {
+      plan = await automodSteps(interaction.guild, settings, inviteCodes(interaction.options.getString('allow')));
+    } catch (err) {
+      await interaction.editReply(err.code === 50013 ? 'The bot needs the Manage Server permission to set up AutoMod.' : `Could not read the AutoMod rules: ${err.message}`);
+      return;
+    }
+    const lines = await runSteps(plan.steps);
+    if (plan.kept) lines.push(`Kept your own mention spam rule "${plan.kept}": a server can have only one.`);
+    if (!plan.alerts) lines.push('Blocked messages are not reported anywhere yet: pick a log channel with /modlog, then run /automod-setup again.');
+    if (!plan.exempt) lines.push('The bot has no role of its own to exempt, so AutoMod may block its own log posts when they quote a link.');
+    await interaction.editReply(fit(lines));
+    await logChange(interaction, settings, 'AutoMod setup', lines);
+  });
+  if (!ran) await interaction.editReply('Another change is running on this server. Try again in a moment.');
 }
 
 /** A settings change in the mod log: who made it and how each step went. */

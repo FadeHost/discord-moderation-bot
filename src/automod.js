@@ -1,4 +1,5 @@
 import { AutoModerationActionType, AutoModerationRuleEventType, AutoModerationRuleTriggerType } from 'discord.js';
+import { STAFF } from './protection.js';
 
 export const INVITE_RULE = 'Block invite links to other servers';
 export const MENTION_RULE = 'Block mention spam';
@@ -27,19 +28,23 @@ async function ownCodes(guild, extra) {
 
 /**
  * The steps that create the bot's AutoMod rules, or refresh them when they exist.
- * A refresh keeps the keywords, allowed links and exemptions an admin added by hand.
+ * A refresh keeps the keywords, patterns, allowed links, actions and exemptions an admin added by hand.
  */
 export async function automodSteps(guild, settings, extra = []) {
   const me = guild.members.me;
   const rules = [...(await guild.autoModerationRules.fetch()).values()]; // needs Manage Server
   const codes = await ownCodes(guild, extra);
-  const alert = settings.logChannelId ? [{ type: AutoModerationActionType.SendAlertMessage, metadata: { channel: settings.logChannelId } }] : [];
+  // A log channel that was deleted, or one in another server, would get both rules refused.
+  const logId = settings.logChannelId && guild.channels.cache.has(settings.logChannelId) ? settings.logChannelId : null;
+  const alert = logId ? [{ type: AutoModerationActionType.SendAlertMessage, metadata: { channel: logId } }] : [];
+  // Staff are never checked by the bot, so AutoMod leaves them alone too. It
+  // blocks bots as well (API error 200000), the bot's own log posts included.
+  const staff = [...guild.roles.cache.values()].filter((role) => !role.managed && role.id !== guild.id && role.permissions.any(STAFF)).map((role) => role.id);
   const common = {
     eventType: AutoModerationRuleEventType.MessageSend,
     enabled: true,
-    // AutoMod blocks bots too (API error 200000), the bot's own log posts included.
-    exemptRoles: me.roles.botRole ? [me.roles.botRole.id] : [],
-    exemptChannels: settings.logChannelId ? [settings.logChannelId] : [],
+    exemptRoles: [...(me.roles.botRole ? [me.roles.botRole.id] : []), ...staff].slice(0, 20),
+    exemptChannels: logId ? [logId] : [],
     reason: 'Moderation bot: AutoMod setup',
   };
   const invite = {
@@ -63,26 +68,36 @@ export async function automodSteps(guild, settings, extra = []) {
       ...alert,
     ],
   };
+  // This server's own invites go first so a full allow list drops older entries, never them.
   const keep = (old, rule) => ({
     ...rule,
     triggerMetadata: rule.triggerMetadata.keywordFilter ? {
       keywordFilter: union(old.triggerMetadata.keywordFilter, rule.triggerMetadata.keywordFilter),
-      allowList: union(old.triggerMetadata.allowList, rule.triggerMetadata.allowList).slice(0, 100),
+      regexPatterns: old.triggerMetadata.regexPatterns,
+      allowList: union(rule.triggerMetadata.allowList, old.triggerMetadata.allowList).slice(0, 100),
     } : rule.triggerMetadata,
-    exemptRoles: union(old.exemptRoles.keys(), rule.exemptRoles).slice(0, 20),
-    exemptChannels: union(old.exemptChannels.keys(), rule.exemptChannels).slice(0, 50),
+    actions: [
+      ...rule.actions,
+      ...old.actions.filter((action) => !rule.actions.some((ours) => ours.type === action.type)).map((action) => ({
+        type: action.type,
+        metadata: { durationSeconds: action.metadata.durationSeconds ?? undefined, channel: action.metadata.channelId ?? undefined, customMessage: action.metadata.customMessage ?? undefined },
+      })),
+    ],
+    exemptRoles: union(rule.exemptRoles, old.exemptRoles.keys()).slice(0, 20),
+    exemptChannels: union(rule.exemptChannels, old.exemptChannels.keys()).slice(0, 50),
   });
   const mine = (rule) => rule.creatorId === guild.client.user.id;
   const oldInvite = rules.find((rule) => mine(rule) && rule.name === INVITE_RULE);
   const oldMention = rules.find((rule) => rule.triggerType === AutoModerationRuleTriggerType.MentionSpam); // a server can have only one
   const allowed = codes.length ? `, except this server's own invites (${codes.join(', ')})` : '';
+  const exempt = staff.length ? ' Staff roles and the bot are exempt.' : ' The bot is exempt.';
   const steps = [{
-    text: `${oldInvite ? 'update' : 'create'} the AutoMod rule "${INVITE_RULE}": messages with discord.gg, discord.com/invite or discordapp.com/invite links are blocked${allowed}`,
+    text: `${oldInvite ? 'update' : 'create'} the AutoMod rule "${INVITE_RULE}": messages with discord.gg, discord.com/invite or discordapp.com/invite links are blocked${allowed}.${exempt}`,
     run: () => (oldInvite ? oldInvite.edit(keep(oldInvite, invite)) : guild.autoModerationRules.create(invite)),
   }];
   if (!oldMention || mine(oldMention)) {
     steps.push({
-      text: `${oldMention ? 'update' : 'create'} the AutoMod rule "${MENTION_RULE}": a message with more than ${MENTION_LIMIT} mentions is blocked and its sender timed out for an hour, and mention raids are blocked`,
+      text: `${oldMention ? 'update' : 'create'} the AutoMod rule "${MENTION_RULE}": a message with more than ${MENTION_LIMIT} mentions is blocked and its sender timed out for an hour, and mention raids are blocked.${exempt}`,
       run: () => (oldMention ? oldMention.edit(keep(oldMention, mention)) : guild.autoModerationRules.create(mention)),
     });
   }

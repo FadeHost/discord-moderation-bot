@@ -12,7 +12,8 @@ export const STAFF = [P.Administrator, P.ManageGuild, P.ManageRoles, P.ManageCha
 // App spam. A member can run an app installed on their own Discord account,
 // not on this server, and have it post in any channel they can use. Discord
 // shows those posts without saying who ran the app, but every one carries
-// interaction metadata naming that person, so the bot acts on them.
+// interaction metadata naming the account the app is installed on, so the
+// bot acts on that person.
 const APP_WINDOW = 60_000; // within a minute, that person's apps posted
 const APP_CHANNELS = 3; // in this many channels,
 const APP_MESSAGES = 10; // or this many times.
@@ -24,63 +25,97 @@ const COPY_WINDOW = 30_000;
 const COPY_CHANNELS = 3;
 const COPY_MEMORY = 2 * 60_000;
 
-const INVITE = /(?:discord(?:app)?\.com\/invite|discord\.gg)\/[\w-]+/i;
-const EVERYONE = /@(?:everyone|here)/i;
+const INVITES = /(?:discord(?:app)?\.com\/invite|discord\.gg)\/([\w-]+)/gi;
+const EVERYONE = /(?<![\w.@])@(?:everyone|here)\b/i;
 
 const recent = new Map(); // kind:guild:user -> [{ channel, id, at, print, gone }], oldest first
 const caught = new Map(); // kind:guild:user -> { until, print }: until then their posts are removed without a new log entry
 const queues = new Map(); // kind:guild:user -> the check running for that person
+const inviteHomes = new Map(); // invite code -> { guildId, until }
 
 export const isStaff = (member) => member.id === member.guild.ownerId || member.permissions.any(STAFF);
 
 /** Every message the bot can see comes through here. */
 export async function protect(message) {
-  if (!message.inGuild() || message.author.id === message.client.user.id) return;
-  const meta = message.interactionMetadata;
-  if (meta && installedOnPersonOnly(meta)) return checkApp(message, meta.user);
+  // Taken now: a check can wait its turn behind others, and the channel may be gone by then.
+  const channel = message.channel;
+  if (!message.inGuild() || !channel || message.author.id === message.client.user.id) return;
+  const owner = message.interactionMetadata && installedOn(message.interactionMetadata);
+  if (owner) return checkApp(message, channel, owner);
   if (message.author.bot || message.webhookId || message.system || !message.member) return;
   // Without the Message Content intent every message arrives empty, so there is nothing to compare.
-  if (canRead(message)) await checkCopies(message);
+  if (canRead(message)) await checkCopies(message, channel);
+}
+
+/** An app that answers "thinking..." first says what it has to say in an edit, so app posts are checked again then. */
+export async function protectEdit(message) {
+  const channel = message.channel;
+  if (message.partial || !message.inGuild() || !channel) return;
+  const owner = message.interactionMetadata && installedOn(message.interactionMetadata);
+  if (owner) await checkApp(message, channel, owner, true);
 }
 
 const canRead = (message) => message.client.options.intents.has(GatewayIntentBits.MessageContent);
 
-/** The app is installed on the account of the person who ran it, and not on this server. */
-function installedOnPersonOnly(meta) {
-  const owners = Object.keys(meta.authorizingIntegrationOwners?.toJSON() ?? {});
-  return owners.length === 1 && owners[0] === String(ApplicationIntegrationType.UserInstall);
+/**
+ * The person whose account the app is installed on, when it is installed on
+ * a person and not on this server. Not interaction_metadata.user: on a button
+ * click that is whoever clicked, and anyone can click a spam app's button.
+ */
+function installedOn(meta) {
+  const owners = meta.authorizingIntegrationOwners?.toJSON() ?? {};
+  const kinds = Object.keys(owners);
+  return kinds.length === 1 && kinds[0] === String(ApplicationIntegrationType.UserInstall) ? owners[kinds[0]] : null;
 }
 
-async function checkApp(message, runner) {
+async function checkApp(message, channel, ownerId, edited = false) {
   const settings = await getGuild(message.guildId);
   const rules = protectionOf(settings);
   if (!rules.appSpam) return;
-  const key = `app:${message.guildId}:${runner.id}`;
+  const key = `app:${message.guildId}:${ownerId}`;
   await inTurn(key, async () => {
-    const now = Date.now();
-    const posts = remember(key, { channel: message.channel, id: message.id, at: now }, APP_MEMORY);
-    if (caught.get(key)?.until > now) return removeAll(posts);
-    const lately = posts.filter((post) => now - post.at < APP_WINDOW);
-    const channels = new Set(lately.map((post) => post.channel.id)).size;
+    // Discord's own time for the message: after a reconnect, missed messages arrive in one burst.
+    const at = message.createdTimestamp;
+    // An edited post was counted when it arrived; count it only if it never was.
+    const known = edited && recent.get(key)?.some((post) => post.id === message.id);
+    const posts = known ? recent.get(key) : remember(key, { channel, id: message.id, at }, APP_MEMORY);
+    if (caught.get(key)?.until > at) return removeAll(posts);
+    const lately = posts.filter((post) => at - post.at < APP_WINDOW);
+    const channels = new Set(lately.map((post) => place(post.channel))).size;
     const text = textOf(message);
-    const why = (message.mentions.everyone || EVERYONE.test(text)) && INVITE.test(text) ? 'posted @everyone with an invite link'
+    const blast = (message.mentions.everyone || EVERYONE.test(text)) && (await invitesElsewhere(message.guild, text));
+    const why = blast ? 'posted @everyone with an invite to another server'
       : channels >= APP_CHANNELS ? `posted in ${channels} channels within a minute`
         : lately.length >= APP_MESSAGES ? `posted ${lately.length} times within a minute`
           : null;
     if (!why) return;
-    const member = await message.guild.members.fetch(runner.id).catch(() => null);
+    const guild = message.guild;
+    if (ownerId === guild.ownerId) return;
+    let member = null;
+    try {
+      member = await guild.members.fetch(ownerId);
+    } catch (err) {
+      // Only "Unknown Member" means they left. Any other failure could hide
+      // a moderator, so nothing happens rather than the wrong thing.
+      if (err.code !== 10007) {
+        console.error(`[moderation-bot] could not look up ${ownerId}, so their app's posts are left alone:`, err.message);
+        return;
+      }
+    }
     if (member && isStaff(member)) return;
-    caught.set(key, { until: now + APP_MEMORY });
+    const person = member?.user ?? (await message.client.users.fetch(ownerId).catch(() => ({ id: ownerId, tag: ownerId })));
+    const clicker = message.interactionMetadata.user;
+    caught.set(key, { until: at + APP_MEMORY });
     const removed = await removeAll(posts);
-    const outcome = await act(message.guild, member, runner, rules, `Moderation bot: an app they ran ${why}`, 'an app you ran posted spam in the server.');
-    await report(message.guild, settings, {
-      title: 'App spam removed', person: runner, app: message.author, why: `An app they ran ${why}.`, text, readable: canRead(message), removed, outcome,
-      later: 'Anything more their apps post in the next 15 minutes is deleted too.',
+    const outcome = await act(guild, member, person, rules, `Moderation bot: an app they ran ${why}`, 'an app you ran posted spam in the server.');
+    await report(guild, settings, {
+      title: 'App spam removed', person, app: message.author, clicker: clicker && clicker.id !== ownerId ? clicker : null, why: `An app they ran ${why}.`,
+      text, readable: canRead(message), removed, outcome, later: 'Anything more their apps post in the next 15 minutes is deleted too.',
     });
   });
 }
 
-async function checkCopies(message) {
+async function checkCopies(message, channel) {
   if (isStaff(message.member)) return;
   const print = fingerprint(message);
   if (!print) return;
@@ -89,13 +124,13 @@ async function checkCopies(message) {
   if (!rules.copySpam) return;
   const key = `copy:${message.guildId}:${message.author.id}`;
   await inTurn(key, async () => {
-    const now = Date.now();
-    const copies = remember(key, { channel: message.channel, id: message.id, at: now, print }, COPY_MEMORY).filter((post) => post.print === print);
+    const at = message.createdTimestamp;
+    const copies = remember(key, { channel, id: message.id, at, print }, COPY_MEMORY).filter((post) => post.print === print);
     const earlier = caught.get(key);
-    if (earlier?.until > now && earlier.print === print) return removeAll(copies);
-    const channels = new Set(copies.filter((post) => now - post.at < COPY_WINDOW).map((post) => post.channel.id)).size;
+    if (earlier?.until > at && earlier.print === print) return removeAll(copies);
+    const channels = new Set(copies.filter((post) => at - post.at < COPY_WINDOW).map((post) => place(post.channel))).size;
     if (channels < COPY_CHANNELS) return;
-    caught.set(key, { until: now + COPY_MEMORY, print });
+    caught.set(key, { until: at + COPY_MEMORY, print });
     const removed = await removeAll(copies);
     const outcome = await act(message.guild, message.member, message.author, rules, `Moderation bot: the same message in ${channels} channels within 30 seconds`,
       `your account posted the same message in ${channels} channels within 30 seconds. If that was not you, change your Discord password and turn on two-factor authentication.`);
@@ -104,6 +139,24 @@ async function checkCopies(message) {
       text: textOf(message), readable: true, removed, outcome, later: 'More copies in the next 2 minutes are deleted too.',
     });
   });
+}
+
+/** A thread counts as the channel it belongs to: a helper answering three forum posts with the same link is not spreading spam. */
+const place = (channel) => (channel.isThread?.() ? channel.parentId : channel.id);
+
+/** True when the text links an invite to some other server. An invite Discord does not know counts as another server's. */
+async function invitesElsewhere(guild, text) {
+  for (const [, code] of text.matchAll(INVITES)) {
+    if (guild.vanityURLCode && code.toLowerCase() === guild.vanityURLCode.toLowerCase()) continue;
+    let home = inviteHomes.get(code);
+    if (!home || home.until < Date.now()) {
+      const guildId = await guild.client.fetchInvite(code).then((invite) => invite.guild?.id ?? null, () => null);
+      home = { guildId, until: Date.now() + 10 * 60_000 };
+      inviteHomes.set(code, home);
+    }
+    if (home.guildId !== guild.id) return true;
+  }
+  return false;
 }
 
 /** Checks one message at a time per person, so a burst is judged in order and acted on once. */
@@ -123,11 +176,16 @@ function remember(key, post, memory) {
   return posts;
 }
 
-/** The same message gives the same print. Short chat with no link or file gives none: "thanks" in three channels is not spam. */
+/**
+ * The same message gives the same print. Short chat with no link or file
+ * gives none: "thanks" in three channels is not spam, and neither is a lone
+ * role ping or emoji, however long it is in its raw form (<@&123...>).
+ */
 function fingerprint(message) {
   const text = message.content.toLowerCase().replace(/\s+/g, ' ').trim();
+  const words = text.replace(/<a?:\w+:\d+>|<@[!&]?\d+>|<#\d+>|\p{Extended_Pictographic}/gu, '').replace(/\s+/g, ' ').trim();
   const files = message.attachments.map((file) => `${file.name}:${file.size}`).join(',');
-  if (!files && text.length < 20 && !/https?:\/\/|discord\.gg\//.test(text)) return null;
+  if (!files && words.length < 20 && !/https?:\/\/|discord\.gg\//.test(text)) return null;
   return `${text}|${files}`;
 }
 
@@ -166,11 +224,11 @@ async function removeAll(posts) {
         await channel.bulkDelete(batch); // a batch of one is a plain delete
         count += batch.length;
       } catch (err) {
-        if (err.code === 10008) {
-          count += batch.length; // Unknown Message: someone deleted it first
+        if (err.code === 10008 || err.code === 10003) {
+          count += batch.length; // Unknown Message or Channel: someone deleted it first
         } else {
           failed.push(channel.id);
-          console.error(`[moderation-bot] could not delete spam in #${channel.name}:`, err.message);
+          console.error(`[moderation-bot] could not delete spam in #${channel.name ?? channel.id}:`, err.message);
         }
       }
     }
@@ -202,7 +260,7 @@ async function act(guild, member, user, rules, reason, told) {
 const refusal = (err) => (err.code === 50013 ? 'Discord refused, the bot is missing a permission or its role is too low.' : `${err.message}.`);
 
 /** The log entry: a copy of the message, who was behind it, what was removed and done, and buttons to undo it or go further. */
-async function report(guild, settings, { title, person, app, why, text, readable, removed, outcome, later }) {
+async function report(guild, settings, { title, person, app, clicker, why, text, readable, removed, outcome, later }) {
   const where = removed.channels.map((id) => `<#${id}>`).join(' ');
   const failed = removed.failed.length ? `\nCould not delete in ${removed.failed.map((id) => `<#${id}>`).join(' ')}: the bot needs Manage Messages there.` : '';
   const embed = new EmbedBuilder()
@@ -212,6 +270,7 @@ async function report(guild, settings, { title, person, app, why, text, readable
     .addFields(
       { name: app ? 'Ran by' : 'Member', value: `<@${person.id}> ${escapeMarkdown(person.tag)} (${person.id})` },
       ...(app ? [{ name: 'App', value: `${escapeMarkdown(app.tag)} (${app.id}), installed on their own account, not on this server` }] : []),
+      ...(clicker ? [{ name: 'Clicked by', value: `<@${clicker.id}> ${escapeMarkdown(clicker.tag)} (${clicker.id}), who pressed a button on the app's message and was left alone` }] : []),
       { name: 'Why', value: why },
       { name: 'Removed', value: `${removed.count} message(s) in ${where}${failed}\n${later}` },
       { name: 'Action', value: outcome.text },
@@ -245,11 +304,12 @@ export function forgive(guildId, userId) {
   }
 }
 
-// Forget people who have gone quiet.
+// Forget people who have gone quiet, and invites looked up a while ago.
 setInterval(() => {
   const now = Date.now();
   for (const [key, posts] of recent) if (now - posts.at(-1).at > APP_MEMORY) recent.delete(key);
   for (const [key, entry] of caught) if (entry.until < now) caught.delete(key);
+  for (const [code, home] of inviteHomes) if (home.until < now) inviteHomes.delete(code);
 }, 60_000).unref();
 
 /** /protection: changes the settings given, then shows them all. Returns the changes for the log. */
@@ -276,7 +336,7 @@ function describe(guild, settings) {
   const where = settings.logChannelId ? `in <#${settings.logChannelId}>` : 'in the bot\'s console only (pick a channel with /modlog)';
   return [
     '**Automatic spam protection**',
-    `- App spam: **${rules.appSpam ? 'on' : 'off'}**. Caught when apps a member installed on their own account post in ${APP_CHANNELS} channels or ${APP_MESSAGES} times within a minute${readable ? ', or post @everyone with an invite link' : ''}.`,
+    `- App spam: **${rules.appSpam ? 'on' : 'off'}**. Caught when apps a member installed on their own account post in ${APP_CHANNELS} channels or ${APP_MESSAGES} times within a minute${readable ? ', or post @everyone with an invite to another server' : ''}.`,
     `- Copy-paste spam: **${!rules.copySpam ? 'off' : readable ? 'on' : 'on, but skipped until the bot has the Message Content intent'}**. Caught when a member posts the same message in ${COPY_CHANNELS} channels within 30 seconds, as hacked accounts do.`,
     `- Then the spam is deleted, ${action}, and it is logged ${where}.`,
     '- Staff are never checked: anyone with Manage Messages, Moderate Members, Kick or Ban Members, Manage Channels, Manage Roles, Manage Server or Administrator.',

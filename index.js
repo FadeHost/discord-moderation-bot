@@ -1,6 +1,6 @@
 import { ApplicationFlagsBitField, Client, GatewayIntentBits, Events, MessageFlags, REST, Routes } from 'discord.js';
 import { commands, handleButton, handleCommand } from './src/commands.js';
-import { protect } from './src/protection.js';
+import { protect, protectEdit } from './src/protection.js';
 
 const token = (process.env.DISCORD_TOKEN || '').trim();
 if (!token) {
@@ -50,9 +50,14 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
-// Every message the bot can see goes through the spam checks in src/protection.js.
+// Every message the bot can see goes through the spam checks in src/protection.js,
+// and app posts again when edited: an app that answers "thinking..." first
+// says what it has to say in an edit.
 client.on(Events.MessageCreate, (message) => {
   protect(message).catch((err) => console.error('[moderation-bot] spam check failed:', err));
+});
+client.on(Events.MessageUpdate, (before, message) => {
+  protectEdit(message).catch((err) => console.error('[moderation-bot] spam check failed:', err));
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
