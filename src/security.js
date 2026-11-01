@@ -174,7 +174,7 @@ async function createLogChannel(guild, settings) {
   const me = guild.members.me;
   const has = (flags) => flags.filter((flag) => me.permissions.has(flag)); // a bot can only allow what it has itself
   const staff = [...guild.roles.cache.values()]
-    .filter((role) => !role.managed && role.id !== guild.id && role.permissions.any([P.Administrator, P.ManageGuild, P.ManageMessages, P.ModerateMembers]))
+    .filter((role) => !role.managed && role.id !== guild.id && role.permissions.any(STAFF)) // the same staff the checks leave alone
     .slice(0, 20);
   const channel = await guild.channels.create({
     name: 'mod-log',
