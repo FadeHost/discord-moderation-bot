@@ -1,8 +1,12 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-// Warnings and the log channel persist to the FadeHost bot's /data volume.
+// Warnings, the log channel and the protection settings persist to the FadeHost bot's /data volume.
 const DATA_FILE = process.env.CONFIG_PATH || '/data/moderation-config.json';
+
+// What the automatic protection does until /protection changes it. Banning is
+// opt-in: a timeout given by mistake is lifted with one click, a ban is not.
+export const PROTECTION_DEFAULTS = { appSpam: true, copySpam: true, timeoutMinutes: 1440, ban: false };
 
 let cache = null;
 
@@ -35,4 +39,9 @@ export async function getGuild(guildId) {
     await save();
   }
   return data.guilds[guildId];
+}
+
+/** The server's protection settings. Servers saved before protection existed have none stored and get the defaults. */
+export function protectionOf(settings) {
+  return { ...PROTECTION_DEFAULTS, ...settings.protection };
 }

@@ -1,17 +1,17 @@
 {
   "name": "fadehost-moderation-bot",
-  "version": "1.0.0",
-  "description": "Warnings, timeouts, kicks, bans and message purges with a moderation log. Hosted by FadeHost.",
+  "version": "1.1.0",
+  "description": "Automatic spam protection, a security check, AutoMod setup, warnings, timeouts, kicks, bans and message purges with a moderation log. Hosted by FadeHost.",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "dependencies": {
-    "discord.js": "^14.16.3"
+    "discord.js": "^14.28.0"
   },
   "license": "MIT"
 }
