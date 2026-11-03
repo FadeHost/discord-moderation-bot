@@ -50,7 +50,7 @@ export async function protect(message) {
   if (canRead(message)) await checkCopies(message, channel);
 }
 
-/** An app that answers "thinking..." first says what it has to say in an edit, so app posts are checked again then. */
+/** An app that answers "thinking..." first says what it has to say in an edit, so app posts are read again then. */
 export async function protectEdit(message) {
   const channel = message.channel;
   if (message.partial || !message.inGuild() || !channel) return;
@@ -77,13 +77,15 @@ async function checkApp(message, channel, ownerId, edited = false) {
   if (!rules.appSpam) return;
   const key = `app:${message.guildId}:${ownerId}`;
   await inTurn(key, async () => {
-    // Discord's own time for the message: after a reconnect, missed messages arrive in one burst.
-    const at = message.createdTimestamp;
-    // An edited post was counted when it arrived; count it only if it never was.
-    const known = edited && recent.get(key)?.some((post) => post.id === message.id);
-    const posts = known ? recent.get(key) : remember(key, { channel, id: message.id, at }, APP_MEMORY);
+    // Discord's own time for the post or the edit: after a reconnect, missed messages arrive in one burst.
+    const at = edited ? (message.editedTimestamp ?? Date.now()) : message.createdTimestamp;
+    // An edit is no new post: the post was counted when it arrived, so only its new text is judged.
+    // Counted again at the time it was first posted, it would make every post since look like one burst.
+    const remembered = recent.get(key) ?? [];
+    const posts = !edited ? remember(key, { channel, id: message.id, at }, APP_MEMORY)
+      : remembered.some((post) => post.id === message.id) ? remembered : [...remembered, { channel, id: message.id, at: message.createdTimestamp }];
     if (caught.get(key)?.until > at) return removeAll(posts);
-    const lately = posts.filter((post) => at - post.at < APP_WINDOW);
+    const lately = edited ? [] : posts.filter((post) => at - post.at < APP_WINDOW);
     const channels = new Set(lately.map((post) => place(post.channel))).size;
     const text = textOf(message);
     const blast = (message.mentions.everyone || EVERYONE.test(text)) && (await invitesElsewhere(message.guild, text));
