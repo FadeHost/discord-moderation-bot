@@ -1,6 +1,6 @@
-import { ApplicationFlagsBitField, Client, GatewayIntentBits, Events, MessageFlags, REST, Routes } from 'discord.js';
+import { ApplicationFlagsBitField, Client, GatewayIntentBits, Events, MessageFlags, Partials, REST, Routes } from 'discord.js';
 import { commands, handleButton, handleCommand } from './src/commands.js';
-import { protect, protectEdit } from './src/protection.js';
+import { forget, protect, protectEdit } from './src/protection.js';
 
 const token = (process.env.DISCORD_TOKEN || '').trim();
 if (!token) {
@@ -34,6 +34,8 @@ const client = new Client({
     GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildMessages,
     ...(readsMessages ? [GatewayIntentBits.MessageContent] : []),
   ],
+  // Deletes of messages the bot no longer holds arrive too, so a deleted copy is always forgotten.
+  partials: [Partials.Message],
 });
 
 client.once(Events.ClientReady, async (c) => {
@@ -57,7 +59,18 @@ client.on(Events.MessageCreate, (message) => {
   protect(message).catch((err) => console.error('[moderation-bot] spam check failed:', err));
 });
 client.on(Events.MessageUpdate, (before, message) => {
+  // Only edits of messages the bot still holds: an app's "thinking..." answer is
+  // edited within seconds, long before it leaves the bot's cache.
+  if (before.partial) return;
   protectEdit(message).catch((err) => console.error('[moderation-bot] spam check failed:', err));
+});
+// A deleted message stops counting as a copy, so a member who deletes a post
+// and asks again in the right channel is not taken for a spammer.
+client.on(Events.MessageDelete, (message) => {
+  forget([message]).catch((err) => console.error('[moderation-bot] could not forget a deleted message:', err));
+});
+client.on(Events.MessageBulkDelete, (messages) => {
+  forget(messages.values()).catch((err) => console.error('[moderation-bot] could not forget deleted messages:', err));
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {

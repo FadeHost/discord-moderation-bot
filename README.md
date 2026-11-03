@@ -19,9 +19,9 @@ Already running an older version? Redeploy it in the FadeHost panel, open the in
 It is on from the start. When it catches something, it deletes the spam, times the person out for a day and logs it with a copy of the message. Staff (anyone with Manage Messages, Moderate Members, Kick or Ban Members, Manage Channels, Manage Roles, Manage Server or Administrator) are never checked.
 
 - **App spam.** Members can run apps installed on their own Discord account, not on your server, and have them post in your channels. Discord does not show who ran such an app; the bot reads it from the message and acts on that person. It steps in when their apps post in 3 channels or 10 times within a minute, or post @everyone with an invite link (that last check needs the Message Content intent).
-- **Copy-paste spam.** The same message from one member in 3 channels within 30 seconds, the usual sign of a hacked account. A stricter server can make it 2 channels with `/protection copy_channels:2` (anything from 2 to 10). Every copy goes, and the member gets a direct message telling them to change their password. This check needs the Message Content intent and is skipped without it.
+- **Copy-paste spam.** The same message from one member in 3 channels within 30 seconds, the usual sign of a hacked account. Every copy goes, and the member gets a direct message telling them to change their password. A stricter server can lower it to 2 channels with `/protection copy_channels:2` (anything from 2 to 10) and give the copies longer with `copy_within`, up to an hour: 2 channels within 10 minutes also catches a member pasting one question into several channels. A deleted copy stops counting, so a member who deletes a post and asks again in the right channel is left alone. This check needs the Message Content intent and is skipped without it.
 
-Each log entry has a **Remove timeout** button for mistakes and a **Ban** button that asks before it bans. `/protection` shows the settings and changes them: turn either check off, set how many channels the same message may reach, set the timeout length, or ban instead of timing out. Banning is off by default, because a ban given by mistake is much harder to undo than a timeout.
+Each log entry has a **Remove timeout** button for mistakes and a **Ban** button that asks before it bans. `/protection` shows the settings and changes them: turn either check off, set how many channels the same message may reach and in how much time, set the timeout length, or ban instead of timing out. Banning is off by default, because a ban given by mistake is much harder to undo than a timeout.
 
 ## What /securitycheck looks for
 - **Use External Apps** on for @everyone or a role ordinary members have. Discord turns it on by default, and it is how app spam gets in: with it off, apps members installed on their own account only answer the person who ran them. Fix button.
@@ -39,7 +39,7 @@ Every fix button first shows exactly what it will change and asks you to confirm
 |---|---|
 | `/securitycheck` | Lists risky server settings, each with a fix button. |
 | `/automod-setup [allow]` | Creates Discord AutoMod rules: invite links to other servers are blocked (your server's own invites, and any you list, stay allowed), and so are messages with more than 10 mentions. Run it again to refresh. |
-| `/protection [app_spam] [copy_spam] [copy_channels] [timeout_minutes] [ban]` | Shows the automatic spam protection, and changes it. |
+| `/protection [app_spam] [copy_spam] [copy_channels] [copy_within] [timeout_minutes] [ban]` | Shows the automatic spam protection, and changes it. |
 | `/warn user reason` | Warns the member (they get a direct message) and remembers it. |
 | `/warnings user` | The member's warnings. |
 | `/clearwarnings user` | Forgets them. |

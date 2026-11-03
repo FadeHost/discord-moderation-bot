@@ -6,12 +6,17 @@ const DATA_FILE = process.env.CONFIG_PATH || '/data/moderation-config.json';
 
 // What the automatic protection does until /protection changes it. Banning is
 // opt-in: a timeout given by mistake is lifted with one click, a ban is not.
-export const PROTECTION_DEFAULTS = { appSpam: true, copySpam: true, copyChannels: 3, timeoutMinutes: 1440, ban: false };
+export const PROTECTION_DEFAULTS = { appSpam: true, copySpam: true, copyChannels: 3, copySeconds: 30, timeoutMinutes: 1440, ban: false };
 
 // How many channels the same message may reach before it counts as copy-paste
 // spam. One would make every long message spam, so 2 is the floor.
 export const COPY_CHANNELS_MIN = 2;
 export const COPY_CHANNELS_MAX = 10;
+
+// How close together those copies must come, in seconds. Half a minute catches
+// hacked accounts, which post everywhere at once; a longer time also catches a
+// member pasting one question into several channels minutes apart.
+export const COPY_WITHIN = [30, 60, 120, 300, 600, 1800, 3600];
 
 let cache = null;
 let loading = null;
@@ -71,5 +76,6 @@ export function protectionOf(settings) {
   if (!Number.isInteger(copyChannels) || copyChannels < COPY_CHANNELS_MIN || copyChannels > COPY_CHANNELS_MAX) {
     rules.copyChannels = PROTECTION_DEFAULTS.copyChannels;
   }
+  if (!COPY_WITHIN.includes(rules.copySeconds)) rules.copySeconds = PROTECTION_DEFAULTS.copySeconds;
   return rules;
 }

@@ -2,7 +2,7 @@ import {
   ActionRowBuilder, ApplicationIntegrationType, ButtonBuilder, ButtonStyle, EmbedBuilder, GatewayIntentBits, MessageFlags, PermissionFlagsBits, escapeMarkdown,
 } from 'discord.js';
 import { postLog } from './modlog.js';
-import { getGuild, protectionOf, save } from './store.js';
+import { COPY_WITHIN, getGuild, protectionOf, save } from './store.js';
 
 const P = PermissionFlagsBits;
 
@@ -20,10 +20,13 @@ const APP_MESSAGES = 10; // or this many times.
 const APP_MEMORY = 15 * 60_000; // an app can keep posting for 15 minutes after it was run, so cleanup lasts that long
 
 // Copy-paste spam, the usual sign of a hacked account: one member posts the
-// same message in three channels within half a minute. The number of
-// channels is each server's own (/protection copy_channels, 3 by default).
-const COPY_WINDOW = 30_000;
+// same message in three channels within half a minute. How many channels and
+// how close together are each server's own (/protection copy_channels and
+// copy_within), so a server can also catch a member pasting one question into
+// two channels minutes apart. Copies are remembered for 2 minutes, or for the
+// server's time when that is longer.
 const COPY_MEMORY = 2 * 60_000;
+const COPY_MEMORY_MAX = Math.max(COPY_MEMORY, ...COPY_WITHIN.map((seconds) => seconds * 1000));
 
 const INVITES = /(?:discord(?:app)?\.com\/invite|discord\.gg)\/([\w-]+)/gi;
 const EVERYONE = /(?<![\w.@])@(?:everyone|here)\b/i;
@@ -123,23 +126,29 @@ async function checkCopies(message, channel) {
   const rules = protectionOf(settings);
   if (!rules.copySpam) return;
   const key = `copy:${message.guildId}:${message.author.id}`;
+  const copyWindow = rules.copySeconds * 1000;
+  const memory = Math.max(COPY_MEMORY, copyWindow);
   await inTurn(key, async () => {
     const at = message.createdTimestamp;
-    const copies = remember(key, { channel, id: message.id, at, print }, COPY_MEMORY).filter((post) => post.print === print);
+    const copies = remember(key, { channel, id: message.id, at, print }, memory).filter((post) => post.print === print);
     const earlier = caught.get(key);
     if (earlier?.until > at && earlier.print === print) return removeAll(copies);
-    const channels = new Set(copies.filter((post) => at - post.at < COPY_WINDOW).map((post) => place(post.channel))).size;
+    const channels = new Set(copies.filter((post) => at - post.at < copyWindow).map((post) => place(post.channel))).size;
     if (channels < rules.copyChannels) return;
-    caught.set(key, { until: at + COPY_MEMORY, print });
+    caught.set(key, { until: at + memory, print });
     const removed = await removeAll(copies);
-    const outcome = await act(message.guild, message.member, message.author, rules, `Moderation bot: the same message in ${channels} channels within 30 seconds`,
-      `your account posted the same message in ${channels} channels within 30 seconds. If that was not you, change your Discord password and turn on two-factor authentication.`);
+    const what = `the same message in ${channels} channels within ${span(rules.copySeconds)}`;
+    const outcome = await act(message.guild, message.member, message.author, rules, `Moderation bot: ${what}`,
+      `your account posted ${what}. If that was not you, change your Discord password and turn on two-factor authentication.`);
     await report(message.guild, settings, {
-      title: 'Copy-paste spam removed', person: message.author, why: `Posted the same message in ${channels} channels within 30 seconds, as hacked accounts do.`,
-      text: textOf(message), readable: true, removed, outcome, later: 'More copies in the next 2 minutes are deleted too.',
+      title: 'Copy-paste spam removed', person: message.author, why: `Posted ${what}${asHacked(rules)}.`,
+      text: textOf(message), readable: true, removed, outcome, later: `More copies in the next ${duration(memory / 60_000)} are deleted too.`,
     });
   });
 }
+
+/** Half a minute or so is how hacked accounts post. A longer time is the server's own stricter rule, not a sign of one. */
+const asHacked = (rules) => (rules.copySeconds <= 60 ? ', as hacked accounts do' : '');
 
 /** A thread counts as the channel it belongs to: a helper answering three forum posts with the same link is not spreading spam. */
 const place = (channel) => (channel.isThread?.() ? channel.parentId : channel.id);
@@ -296,6 +305,11 @@ export function duration(minutes) {
   return `${size} ${unit}${size === 1 ? '' : 's'}`;
 }
 
+/** A time given in seconds, in words: 30 seconds, 10 minutes, 1 hour. */
+export function span(seconds) {
+  return seconds % 60 ? `${seconds} second${seconds === 1 ? '' : 's'}` : duration(seconds / 60);
+}
+
 /** A moderator lifted the timeout: stop removing that person's posts. */
 export function forgive(guildId, userId) {
   for (const kind of ['app', 'copy']) {
@@ -304,13 +318,38 @@ export function forgive(guildId, userId) {
   }
 }
 
-// Forget people who have gone quiet, and invites looked up a while ago.
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, posts] of recent) if (now - posts.at(-1).at > APP_MEMORY) recent.delete(key);
+/**
+ * A deleted message stops counting as a copy: a member who deletes a post and
+ * asks again in the right channel is not spamming. Discord says only which
+ * message went, so one the bot no longer holds is found among those remembered.
+ * App posts keep counting: deleting spam as it comes must not hide the spammer.
+ */
+export function forget(messages) {
+  const byKey = new Map();
+  for (const message of messages) {
+    if (!message.guildId) continue;
+    const key = message.author ? `copy:${message.guildId}:${message.author.id}`
+      : [...recent.keys()].find((known) => known.startsWith(`copy:${message.guildId}:`) && recent.get(known).some((post) => post.id === message.id));
+    // Nothing remembered and no check waiting: most deleted messages were never copies.
+    if (key && (recent.has(key) || queues.has(key))) byKey.set(key, [...(byKey.get(key) ?? []), message.id]);
+  }
+  // In turn, so a message deleted while its own check waits is forgotten after that check has counted it.
+  return Promise.all([...byKey].map(([key, ids]) => inTurn(key, async () => {
+    const posts = (recent.get(key) ?? []).filter((post) => !ids.includes(post.id));
+    // No empty lists: the cleanup below reads each one's last post.
+    if (posts.length) recent.set(key, posts);
+    else recent.delete(key);
+  })));
+}
+
+/** Forgets people who have gone quiet, and invites looked up a while ago. */
+export function sweep(now = Date.now()) {
+  // A server can give copies up to an hour, so copy-paste memories are kept that long.
+  for (const [key, posts] of recent) if (now - posts.at(-1).at > (key.startsWith('copy:') ? COPY_MEMORY_MAX : APP_MEMORY)) recent.delete(key);
   for (const [key, entry] of caught) if (entry.until < now) caught.delete(key);
   for (const [code, home] of inviteHomes) if (home.until < now) inviteHomes.delete(code);
-}, 60_000).unref();
+}
+setInterval(sweep, 60_000).unref();
 
 /** /protection: changes the settings given, then shows them all. Returns the changes for the log. */
 export async function protectionCommand(interaction, settings) {
@@ -318,6 +357,7 @@ export async function protectionCommand(interaction, settings) {
     appSpam: interaction.options.getBoolean('app_spam'),
     copySpam: interaction.options.getBoolean('copy_spam'),
     copyChannels: interaction.options.getInteger('copy_channels'),
+    copySeconds: interaction.options.getInteger('copy_within'),
     timeoutMinutes: interaction.options.getInteger('timeout_minutes'),
     ban: interaction.options.getBoolean('ban'),
   };
@@ -338,7 +378,7 @@ function describe(guild, settings) {
   return [
     '**Automatic spam protection**',
     `- App spam: **${rules.appSpam ? 'on' : 'off'}**. Caught when apps a member installed on their own account post in ${APP_CHANNELS} channels or ${APP_MESSAGES} times within a minute${readable ? ', or post @everyone with an invite to another server' : ''}.`,
-    `- Copy-paste spam: **${!rules.copySpam ? 'off' : readable ? 'on' : 'on, but skipped until the bot has the Message Content intent'}**. Caught when a member posts the same message in ${rules.copyChannels} channels within 30 seconds, as hacked accounts do.`,
+    `- Copy-paste spam: **${!rules.copySpam ? 'off' : readable ? 'on' : 'on, but skipped until the bot has the Message Content intent'}**. Caught when a member posts the same message in ${rules.copyChannels} channels within ${span(rules.copySeconds)}${asHacked(rules)}.`,
     `- Then the spam is deleted, ${action}, and it is logged ${where}.`,
     '- Staff are never checked: anyone with Manage Messages, Moderate Members, Kick or Ban Members, Manage Channels, Manage Roles, Manage Server or Administrator.',
   ].join('\n');
