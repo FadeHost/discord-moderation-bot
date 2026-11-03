@@ -20,9 +20,9 @@ const APP_MESSAGES = 10; // or this many times.
 const APP_MEMORY = 15 * 60_000; // an app can keep posting for 15 minutes after it was run, so cleanup lasts that long
 
 // Copy-paste spam, the usual sign of a hacked account: one member posts the
-// same message in three channels within half a minute.
+// same message in three channels within half a minute. The number of
+// channels is each server's own (/protection copy_channels, 3 by default).
 const COPY_WINDOW = 30_000;
-const COPY_CHANNELS = 3;
 const COPY_MEMORY = 2 * 60_000;
 
 const INVITES = /(?:discord(?:app)?\.com\/invite|discord\.gg)\/([\w-]+)/gi;
@@ -129,7 +129,7 @@ async function checkCopies(message, channel) {
     const earlier = caught.get(key);
     if (earlier?.until > at && earlier.print === print) return removeAll(copies);
     const channels = new Set(copies.filter((post) => at - post.at < COPY_WINDOW).map((post) => place(post.channel))).size;
-    if (channels < COPY_CHANNELS) return;
+    if (channels < rules.copyChannels) return;
     caught.set(key, { until: at + COPY_MEMORY, print });
     const removed = await removeAll(copies);
     const outcome = await act(message.guild, message.member, message.author, rules, `Moderation bot: the same message in ${channels} channels within 30 seconds`,
@@ -317,6 +317,7 @@ export async function protectionCommand(interaction, settings) {
   const given = {
     appSpam: interaction.options.getBoolean('app_spam'),
     copySpam: interaction.options.getBoolean('copy_spam'),
+    copyChannels: interaction.options.getInteger('copy_channels'),
     timeoutMinutes: interaction.options.getInteger('timeout_minutes'),
     ban: interaction.options.getBoolean('ban'),
   };
@@ -337,7 +338,7 @@ function describe(guild, settings) {
   return [
     '**Automatic spam protection**',
     `- App spam: **${rules.appSpam ? 'on' : 'off'}**. Caught when apps a member installed on their own account post in ${APP_CHANNELS} channels or ${APP_MESSAGES} times within a minute${readable ? ', or post @everyone with an invite to another server' : ''}.`,
-    `- Copy-paste spam: **${!rules.copySpam ? 'off' : readable ? 'on' : 'on, but skipped until the bot has the Message Content intent'}**. Caught when a member posts the same message in ${COPY_CHANNELS} channels within 30 seconds, as hacked accounts do.`,
+    `- Copy-paste spam: **${!rules.copySpam ? 'off' : readable ? 'on' : 'on, but skipped until the bot has the Message Content intent'}**. Caught when a member posts the same message in ${rules.copyChannels} channels within 30 seconds, as hacked accounts do.`,
     `- Then the spam is deleted, ${action}, and it is logged ${where}.`,
     '- Staff are never checked: anyone with Manage Messages, Moderate Members, Kick or Ban Members, Manage Channels, Manage Roles, Manage Server or Administrator.',
   ].join('\n');

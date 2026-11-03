@@ -4,7 +4,7 @@ import {
 import { postLog } from './modlog.js';
 import { forgive, protectionCommand } from './protection.js';
 import { automodSetup, securityButton, securityCheck } from './security.js';
-import { getGuild, save } from './store.js';
+import { COPY_CHANNELS_MAX, COPY_CHANNELS_MIN, PROTECTION_DEFAULTS, getGuild, save } from './store.js';
 
 const reason = (o) => o.setName('reason').setDescription('Why').setMaxLength(400);
 const user = (o) => o.setName('user').setDescription('Who').setRequired(true);
@@ -31,7 +31,9 @@ export const commands = [
     .addChannelOption((o) => o.setName('channel').setDescription('The channel, or leave it out to stop logging').addChannelTypes(ChannelType.GuildText)),
   new SlashCommandBuilder().setName('protection').setDescription('Automatic spam protection: see what it does, or change it').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addBooleanOption((o) => o.setName('app_spam').setDescription('Remove spam posted through apps members installed on their own account'))
-    .addBooleanOption((o) => o.setName('copy_spam').setDescription('Remove one message posted in 3 channels at once, as hacked accounts do'))
+    .addBooleanOption((o) => o.setName('copy_spam').setDescription('Remove one message posted in several channels at once, as hacked accounts do'))
+    .addIntegerOption((o) => o.setName('copy_channels').setDescription(`In how many channels the same message counts as copy-paste spam, ${COPY_CHANNELS_MIN} to ${COPY_CHANNELS_MAX} (${PROTECTION_DEFAULTS.copyChannels} by default)`)
+      .setMinValue(COPY_CHANNELS_MIN).setMaxValue(COPY_CHANNELS_MAX))
     .addIntegerOption((o) => o.setName('timeout_minutes').setDescription('How long the person is timed out, 1 to 40320 (four weeks)').setMinValue(1).setMaxValue(40320))
     .addBooleanOption((o) => o.setName('ban').setDescription('Ban instead of a timeout (off by default)')),
   new SlashCommandBuilder().setName('securitycheck').setDescription('Find risky server settings, with buttons that fix them').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
